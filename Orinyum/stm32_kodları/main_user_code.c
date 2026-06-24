@@ -1,18 +1,5 @@
 /* ===========================================================================
  * main.c  –  USER CODE blokları
- * STM32CubeMX projesindeki main.c'ye yapıştırın.
- * Hedef: STM32F4xx  |  HAL sürücü kütüphanesi
- *
- * Pin / peripheral özeti (CubeMX'te eşleşmeli):
- *   htim1  – Motor PWM  (CH1: sol, CH2: sağ)
- *   htim2  – Encoder sol (TIM_ENCODERMODE_TI12)
- *   htim3  – Encoder sağ (TIM_ENCODERMODE_TI12)
- *   htim4  – Taret PWM  (CH1: pitch, CH2: yaw, CH3: lazer)
- *   hi2c1  – BNO055 IMU (0x28)
- *   huart2 – ROS'a telemetri gönderme (115200)
- *   huart3 – GPS NMEA alma   (9600 / 115200)
- *   huart4 – Operatör komutu alma (115200)
- *   GPIOA  – PA1/PA2 sol motor IN, PA3/PA4 sağ motor IN
  * ===========================================================================*/
 
 /* USER CODE BEGIN Includes */
@@ -21,31 +8,35 @@
 #include "robot_modes.h"
 #include "robot_dead_reckoning.h"
 #include "robot_turret.h"
+#include <string.h>
 /* USER CODE END Includes */
 
 /* USER CODE BEGIN 0 */
 #define ORIGIN_LAT  41.000000f   /* harita başlangıç enlemi  */
 #define ORIGIN_LON  29.000000f   /* harita başlangıç boylamı */
 
-/* Otonom mod hız hedefleri (ROS/görev planı tarafından doldurulur) */
-static float autonomous_target_left  = 0.0f;
-static float autonomous_target_right = 0.0f;
+/* Otonom mod hız hedefleri (Dışarıdan erişim için static kaldırıldı, volatile yapıldı) */
+volatile float autonomous_target_left  = 0.0f;
+volatile float autonomous_target_right = 0.0f;
 
-/* Kamera piksel hata değerleri (görüntü işleme ISR / ROS callback'ten gelir) */
+/* Kamera piksel hata değerleri */
 static volatile float pixel_err_pitch = 0.0f;
 static volatile float pixel_err_yaw   = 0.0f;
 
-/* UART alım tamponları */
+/* UART alım tamponları ve ISR Emniyet Katmanı Değişkenleri */
 static uint8_t gps_rx_buffer[128];
 static uint8_t operator_rx_buffer[sizeof(Operator_Cmd_t) + 4U];
+
+volatile bool gps_data_ready = false;
+uint8_t gps_process_buffer[128];
 /* USER CODE END 0 */
 
 
-/* USER CODE BEGIN 2  (MX_xxx_Init() çağrılarının ardından) */
+/* USER CODE BEGIN 2 */
 Robot_Core_Init();
 Telemetry_Init(&htim2, &htim3);
-Robot_Update_IMU(&hi2c1);                    /* IMU'yu ilk kez oku          */
-DR_Init(robot_imu.heading_rad);              /* Dead reckoning'i IMU yönüyle başlat */
+Robot_Update_IMU(&hi2c1);
+DR_Init(robot_imu.heading_rad);
 Modes_Init();
 Turret_Init();
 
@@ -58,6 +49,13 @@ HAL_UART_Receive_IT(&huart4, operator_rx_buffer, sizeof(operator_rx_buffer));
 /* USER CODE BEGIN 3 */
 while (1)
 {
+    /* 0. İki Aşamalı Seri Veri İşleme (strtok'ı ISR dışına çıkarma) */
+    if (gps_data_ready)
+    {
+        Telemetry_Parse_GPS(gps_process_buffer, sizeof(gps_process_buffer));
+        gps_data_ready = false;
+    }
+
     /* 1. Sensör güncelleme */
     Telemetry_Update_Encoders(&htim2, &htim3);
     Robot_Update_IMU(&hi2c1);
@@ -101,7 +99,7 @@ while (1)
                            TIM_CHANNEL_1, pid_left,
                            TIM_CHANNEL_2, pid_right);
 
-        /* 6. Taret – htim4 (htim3 encoder için ayrıldı) */
+        /* 6. Taret güncelleme */
         Turret_Update((float)pixel_err_pitch, (float)pixel_err_yaw,
                       &htim4, TIM_CHANNEL_1,
                       &htim4, TIM_CHANNEL_2,
@@ -115,7 +113,7 @@ while (1)
                                &htim4, TIM_CHANNEL_3);
     }
 
-    /* 7. Telemetri çerçevesi ROS'a gönder */
+    /* 7. Telemetri çerçevesini ROS'a gönder */
     ROS_Frame_t frame = Telemetry_Build_ROS_Frame(
                             robot_imu.roll,
                             robot_imu.pitch,
@@ -132,21 +130,20 @@ while (1)
 
 
 /* USER CODE BEGIN 4 */
-/**
- * @brief UART alım tamamlama ISR
- *        GPS ve operatör komutlarını non-blocking olarak işler.
- */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART3)
     {
-        Telemetry_Parse_GPS(gps_rx_buffer, sizeof(gps_rx_buffer));
+        /* Stage 1: Sadece veriyi emniyetli tampona kopyala ve çık */
+        memcpy(gps_process_buffer, gps_rx_buffer, sizeof(gps_rx_buffer));
+        gps_data_ready = true;
+        
         HAL_UART_Receive_IT(&huart3,
                             gps_rx_buffer,
                             sizeof(gps_rx_buffer));
     }
 
-    if (huart->Instance == UART4)   /* USART4 → UART4 olarak tanımlı */
+    if (huart->Instance == UART4)
     {
         Modes_Parse_Command(operator_rx_buffer, sizeof(operator_rx_buffer));
         HAL_UART_Receive_IT(&huart4,
