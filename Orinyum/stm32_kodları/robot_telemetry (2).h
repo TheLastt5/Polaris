@@ -9,16 +9,13 @@
 #include <stdint.h>
 
 /* ---------------------------------------------------------------------------
- * Encoder sabitleri
- *   DISTANCE_PER_PULSE: tekerlek çevresi / encoder çözünürlüğü  (metre/darbe)
- *   LOOP_PERIOD_S     : ana döngü periyodu = 20 ms
+ * Encoder / döngü sabitleri
  * -------------------------------------------------------------------------*/
-#define DISTANCE_PER_PULSE  0.005f   /* m/darbe  */
-#define LOOP_PERIOD_S       0.020f   /* s         */
+#define DISTANCE_PER_PULSE  0.005f   /* m / darbe  */
+#define LOOP_PERIOD_S       0.020f   /* s  (50 Hz) */
 
 /* ---------------------------------------------------------------------------
- * ROS seri çerçeve başlığı (magic word)
- * Python tarafı bu değere göre frame'i hizalar.
+ * ROS seri çerçeve başlığı
  * -------------------------------------------------------------------------*/
 #define ROS_FRAME_HEADER  0xAA55AA55UL
 
@@ -28,33 +25,20 @@
 typedef struct {
     float   latitude;
     float   longitude;
-    uint8_t fix_quality;   /* 0 = fix yok, 1 = GPS, 2 = DGPS, ... */
+    uint8_t fix_quality;
 } GPS_Data_t;
 
 typedef struct {
-    int32_t total_pulses;      /* birikimli darbe sayısı    */
-    float   current_velocity;  /* anlık hız (m/s)           */
+    int32_t total_pulses;
+    float   current_velocity;   /* m/s */
 } Encoder_Data_t;
 
 /**
- * @brief ROS'a gönderilen seri veri çerçevesi.
- *
- * Alan sırası Python struct formatı '<IfffffffBH' ile bire bir eşleşmeli:
- *   I  → header          (uint32)
- *   f  → imu_roll        (float)
- *   f  → imu_pitch       (float)
- *   f  → imu_yaw         (float)
- *   f  → encoder_vel_left  (float)
- *   f  → encoder_vel_right (float)
- *   f  → gps_lat         (float)
- *   f  → gps_lon         (float)
- *   B  → gps_fix         (uint8)
- *   H  → checksum        (uint16)  ← XOR, imu_roll'dan gps_fix'e kadar
- *
- * packed: padding yok, sizeof = 4+4*7+1+2 = 39 byte
+ * ROS seri çerçevesi – little-endian, packed (35 byte)
+ * Python format: '<I f f f f f f f B H'
  */
 typedef struct __attribute__((packed)) {
-    uint32_t header;
+    uint32_t header;             /* 0xAA55AA55 */
     float    imu_roll;
     float    imu_pitch;
     float    imu_yaw;
@@ -63,11 +47,21 @@ typedef struct __attribute__((packed)) {
     float    gps_lat;
     float    gps_lon;
     uint8_t  gps_fix;
-    uint16_t checksum;
+    uint16_t checksum;           /* XOR: imu_roll'dan gps_fix'e */
 } ROS_Frame_t;
 
 /* ---------------------------------------------------------------------------
- * Global değişkenler
+ * ISR ↔ main-loop GPS bayrak mekanizması
+ *   ISR  → Telemetry_GPS_Stage1_ISR() çağırır (strtok yok)
+ *   main → gps_data_ready != 0 ise Telemetry_Parse_GPS() çağırır
+ *
+ *   gps_data_ready burada tanımlanır (robot_telemetry.c'de),
+ *   main_user_code.c'de extern olarak kullanılır.
+ * -------------------------------------------------------------------------*/
+extern volatile uint8_t gps_data_ready;
+
+/* ---------------------------------------------------------------------------
+ * Global sensör değişkenleri
  * -------------------------------------------------------------------------*/
 extern GPS_Data_t     robot_gps;
 extern Encoder_Data_t robot_encoder_left;
@@ -77,30 +71,29 @@ extern Encoder_Data_t robot_encoder_right;
  * Fonksiyon prototipleri
  * -------------------------------------------------------------------------*/
 
-/**
- * @brief Encoder timer'larını başlatır (HAL_TIM_Encoder_Start).
- * @param htim_left   Sol encoder timer'ı  (örn. &htim2)
- * @param htim_right  Sağ encoder timer'ı  (örn. &htim3)
- */
+/** Encoder timer'larını başlatır (TIM_CHANNEL_ALL, sayaç sıfır). */
 void Telemetry_Init(TIM_HandleTypeDef *htim_left,
                     TIM_HandleTypeDef *htim_right);
 
-/**
- * @brief Her döngüde encoder sayacını okur, sıfırlar, hız hesaplar.
- */
+/** Her 20 ms'de encoder delta okur, hız hesaplar. */
 void Telemetry_Update_Encoders(TIM_HandleTypeDef *htim_left,
                                 TIM_HandleTypeDef *htim_right);
 
 /**
- * @brief $GPGGA NMEA cümlesini ayrıştırır, robot_gps'i günceller.
- * @param nmea_buffer  UART alım tamponu
- * @param len          Geçerli byte sayısı
+ * [ISR-GÜVENLİ] HAL_UART_RxCpltCallback'ten çağrılır.
+ * strtok() ÇAĞIRMAZ – yalnızca veriyi iç tampona kopyalar,
+ * gps_data_ready bayrağını 1 yapar.
  */
-void Telemetry_Parse_GPS(uint8_t *nmea_buffer, uint16_t len);
+void Telemetry_GPS_Stage1_ISR(uint8_t *nmea_buffer, uint16_t len);
 
 /**
- * @brief Tüm sensör verilerini paketleyip ROS çerçevesi döndürür.
+ * [MAIN LOOP] gps_data_ready != 0 olduğunda NMEA'yı ayrıştırır.
+ * strtok() burada güvenle kullanılır.
+ * Her döngüde çağrılmalı; veri yoksa hızla döner.
  */
+void Telemetry_Parse_GPS(void);
+
+/** Tüm sensör verilerini paketleyip ROS çerçevesi döndürür. */
 ROS_Frame_t Telemetry_Build_ROS_Frame(float roll, float pitch, float yaw);
 
 #endif /* ROBOT_TELEMETRY_H */
