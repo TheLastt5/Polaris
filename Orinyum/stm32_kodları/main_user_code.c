@@ -1,5 +1,18 @@
 /* ===========================================================================
  * main.c  –  USER CODE blokları
+ * STM32CubeMX projesindeki main.c'ye yapıştırın.
+ *
+ * Peripheral özeti (CubeMX'te eşleşmeli):
+ *   htim1  – Motor PWM      (CH1=sol, CH2=sağ)
+ *   htim2  – Encoder sol    (TIM_ENCODERMODE_TI12, 32-bit)
+ *   htim3  – Encoder sağ    (TIM_ENCODERMODE_TI12, 16-bit)
+ *   htim4  – Taret PWM      (CH1=pitch, CH2=yaw, CH3=lazer)
+ *   hi2c1  – BNO055 IMU     (0x28)
+ *   huart2 – ROS'a telemetri (115200)
+ *   huart3 – GPS NMEA alma   (9600 veya 115200)
+ *   huart4 – Operatör komutu (115200)
+ *   GPIOA  – PA1/PA2 sol motor IN1/IN2, PA3/PA4 sağ motor IN3/IN4
+ *   GPIOB  – PB0/PB1 pitch servo IN1/IN2, PB2/PB3 yaw servo IN1/IN2
  * ===========================================================================*/
 
 /* USER CODE BEGIN Includes */
@@ -12,27 +25,28 @@
 /* USER CODE END Includes */
 
 /* USER CODE BEGIN 0 */
-#define ORIGIN_LAT  41.000000f   /* harita başlangıç enlemi  */
-#define ORIGIN_LON  29.000000f   /* harita başlangıç boylamı */
+#define ORIGIN_LAT  41.000000f
+#define ORIGIN_LON  29.000000f
 
-/* Otonom mod hız hedefleri (Dışarıdan erişim için static kaldırıldı, volatile yapıldı) */
+/* Otonom mod hız hedefleri:
+ *   volatile  → ROS callback / ISR'den güvenle yazılabilir
+ *   static YOK → başka .c dosyalarından erişilebilir (extern ile)        */
 volatile float autonomous_target_left  = 0.0f;
 volatile float autonomous_target_right = 0.0f;
 
-/* Kamera piksel hata değerleri */
-static volatile float pixel_err_pitch = 0.0f;
-static volatile float pixel_err_yaw   = 0.0f;
+/* Kamera piksel hata değerleri: görüntü işleme modülünden yazılır.
+ *   static YOK → dışarıdan erişilebilir
+ *   volatile   → derleyici optimizasyonu engellenir                      */
+volatile float pixel_err_pitch = 0.0f;
+volatile float pixel_err_yaw   = 0.0f;
 
-/* UART alım tamponları ve ISR Emniyet Katmanı Değişkenleri */
+/* UART alım tamponları */
 static uint8_t gps_rx_buffer[128];
 static uint8_t operator_rx_buffer[sizeof(Operator_Cmd_t) + 4U];
-
-volatile bool gps_data_ready = false;
-uint8_t gps_process_buffer[128];
 /* USER CODE END 0 */
 
 
-/* USER CODE BEGIN 2 */
+/* USER CODE BEGIN 2  (MX_xxx_Init() çağrılarının ardından) */
 Robot_Core_Init();
 Telemetry_Init(&htim2, &htim3);
 Robot_Update_IMU(&hi2c1);
@@ -40,7 +54,6 @@ DR_Init(robot_imu.heading_rad);
 Modes_Init();
 Turret_Init();
 
-/* UART interrupt alımlarını başlat */
 HAL_UART_Receive_IT(&huart3, gps_rx_buffer,      sizeof(gps_rx_buffer));
 HAL_UART_Receive_IT(&huart4, operator_rx_buffer, sizeof(operator_rx_buffer));
 /* USER CODE END 2 */
@@ -49,34 +62,30 @@ HAL_UART_Receive_IT(&huart4, operator_rx_buffer, sizeof(operator_rx_buffer));
 /* USER CODE BEGIN 3 */
 while (1)
 {
-    /* 0. İki Aşamalı Seri Veri İşleme (strtok'ı ISR dışına çıkarma) */
-    if (gps_data_ready)
-    {
-        Telemetry_Parse_GPS(gps_process_buffer, sizeof(gps_process_buffer));
-        gps_data_ready = false;
-    }
+    /* 1. GPS ayrıştırma – bayrak tabanlı, strtok burada güvenli */
+    Telemetry_Parse_GPS();
 
-    /* 1. Sensör güncelleme */
+    /* 2. Sensör güncelleme */
     Telemetry_Update_Encoders(&htim2, &htim3);
     Robot_Update_IMU(&hi2c1);
 
-    /* 2. Güvenlik kontrolü (eğim → otomatik motor durdurma) */
+    /* 3. Güvenlik kontrolü (eğim → motor durdurma) */
     Robot_Check_Safety(&htim1, TIM_CHANNEL_1, TIM_CHANNEL_2);
 
-    /* 3. Konum kestirimi */
+    /* 4. Konum kestirimi */
     DR_Update(robot_encoder_left.current_velocity,
               robot_encoder_right.current_velocity,
               robot_imu.heading_rad,
               LOOP_PERIOD_S);
 
-    /* 4. GPS fix varsa konumu düzelt */
+    /* 5. GPS fix varsa konumu düzelt */
     if (robot_gps.fix_quality > 0U)
     {
         DR_Reset_To_GPS(robot_gps.latitude, robot_gps.longitude,
                         ORIGIN_LAT, ORIGIN_LON);
     }
 
-    /* 5. Motor kontrolü (güvenli modda) */
+    /* 6. Motor + taret kontrolü (güvenli modda) */
     if (Modes_Is_Safe())
     {
         if (Modes_Is_Autonomous())
@@ -99,7 +108,7 @@ while (1)
                            TIM_CHANNEL_1, pid_left,
                            TIM_CHANNEL_2, pid_right);
 
-        /* 6. Taret güncelleme */
+        /* htim3 encoder için ayrıldı → taret htim4 kullanır */
         Turret_Update((float)pixel_err_pitch, (float)pixel_err_yaw,
                       &htim4, TIM_CHANNEL_1,
                       &htim4, TIM_CHANNEL_2,
@@ -107,7 +116,6 @@ while (1)
     }
     else
     {
-        /* Güvensiz durum: taret acil durdurma */
         Turret_Emergency_Stop(&htim4, TIM_CHANNEL_1,
                                &htim4, TIM_CHANNEL_2,
                                &htim4, TIM_CHANNEL_3);
@@ -124,7 +132,7 @@ while (1)
                       (uint16_t)sizeof(frame),
                       10U);
 
-    HAL_Delay(20U);  /* 50 Hz döngü */
+    HAL_Delay(20U);
 }
 /* USER CODE END 3 */
 
@@ -134,10 +142,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART3)
     {
-        /* Stage 1: Sadece veriyi emniyetli tampona kopyala ve çık */
-        memcpy(gps_process_buffer, gps_rx_buffer, sizeof(gps_rx_buffer));
-        gps_data_ready = true;
-        
+        /* ISR-güvenli: sadece kopyala + bayrak set et (strtok YOK) */
+        Telemetry_GPS_Stage1_ISR(gps_rx_buffer, sizeof(gps_rx_buffer));
         HAL_UART_Receive_IT(&huart3,
                             gps_rx_buffer,
                             sizeof(gps_rx_buffer));
@@ -145,6 +151,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
     if (huart->Instance == UART4)
     {
+        /* Modes_Parse_Command: memcpy + kısa döngü, ISR'de kabul edilebilir */
         Modes_Parse_Command(operator_rx_buffer, sizeof(operator_rx_buffer));
         HAL_UART_Receive_IT(&huart4,
                             operator_rx_buffer,
